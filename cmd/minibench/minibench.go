@@ -21,9 +21,15 @@ const (
 	durableOps  = 500
 	rangeScans  = 1000
 	rangeLength = 100
+
+	// Latencies are only meaningful if the clock can resolve them.
+	finestUsefulTick = 10 * time.Microsecond
 )
 
-var value = bytes.Repeat([]byte("v"), valueSize)
+var (
+	value     = bytes.Repeat([]byte("v"), valueSize)
+	clockTick = measureClockTick()
+)
 
 func key(i int) []byte { return []byte(fmt.Sprintf("%016d", i)) }
 
@@ -49,6 +55,10 @@ func run(n int) error {
 
 	fmt.Printf("%d keys, 16-byte keys, %d-byte values, %s/%s, %s\n\n",
 		n, valueSize, runtime.GOOS, runtime.GOARCH, runtime.Version())
+	if clockTick > finestUsefulTick {
+		fmt.Printf("This clock only updates about every %.0f us, so per-operation latency is not shown.\n\n",
+			float64(clockTick.Nanoseconds())/1000)
+	}
 	fmt.Println("| Operation | Count | Per second | Median | 99th percentile |")
 	fmt.Println("|---|---:|---:|---:|---:|")
 
@@ -136,6 +146,21 @@ func run(n int) error {
 	return nil
 }
 
+// measureClockTick returns the largest step seen between clock readings.
+func measureClockTick() time.Duration {
+	var tick time.Duration
+	last := time.Now()
+	for i := 0; i < 20; i++ {
+		now := time.Now()
+		for now.Sub(last) == 0 {
+			now = time.Now()
+		}
+		tick = max(tick, now.Sub(last))
+		last = now
+	}
+	return tick
+}
+
 func load(path, name string, order []int) error {
 	db, err := minidb.Open(path)
 	if err != nil {
@@ -175,5 +200,8 @@ func measure(name string, count int, op func(int) error) error {
 
 // micros uses plain "us" because some Windows terminals garble the micro sign.
 func micros(d time.Duration) string {
+	if clockTick > finestUsefulTick {
+		return "n/a"
+	}
 	return fmt.Sprintf("%.1f us", float64(d.Nanoseconds())/1000)
 }
