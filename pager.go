@@ -1,6 +1,7 @@
 package minidb
 
 import (
+	"cmp"
 	"container/list"
 	"encoding/binary"
 	"fmt"
@@ -96,6 +97,16 @@ func (p *pager) markDirty(pg *page) {
 	p.dirty[pg.id] = pg
 }
 
+// dirtyPages returns the changed pages in page ID order.
+func (p *pager) dirtyPages() []*page {
+	pages := make([]*page, 0, len(p.dirty))
+	for _, pg := range p.dirty {
+		pages = append(pages, pg)
+	}
+	slices.SortFunc(pages, func(a, b *page) int { return cmp.Compare(a.id, b.id) })
+	return pages
+}
+
 // flush writes dirty pages, then page 0 (the metadata), with an fsync after
 // each stage so the metadata never points at pages that are not yet on disk.
 func (p *pager) flush() error {
@@ -130,12 +141,17 @@ func (p *pager) flush() error {
 }
 
 func (p *pager) writePage(pg *page) error {
-	binary.LittleEndian.PutUint32(pg.data[:checksumSize], crc32.Checksum(pg.payload(), crcTable))
+	sealPage(pg.data)
 	if _, err := p.file.WriteAt(pg.data, int64(pg.id)*PageSize); err != nil {
 		return fmt.Errorf("write page %d: %w", pg.id, err)
 	}
 	p.writes++
 	return nil
+}
+
+// sealPage stores the checksum of a full page in its first bytes.
+func sealPage(data []byte) {
+	binary.LittleEndian.PutUint32(data[:checksumSize], crc32.Checksum(data[checksumSize:], crcTable))
 }
 
 func (p *pager) addClean(pg *page) {

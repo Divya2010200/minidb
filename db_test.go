@@ -31,6 +31,13 @@ func openDB(t *testing.T, path string) *DB {
 	return db
 }
 
+// crash closes the files without saving, as if the process had stopped.
+func crash(db *DB) {
+	db.wal.close()
+	db.file.Close()
+	db.closed = true
+}
+
 func mustPut(t *testing.T, db *DB, key, value string) {
 	t.Helper()
 	if err := db.Put(b(key), b(value)); err != nil {
@@ -230,8 +237,7 @@ func TestUnsyncedChangesAreNotWritten(t *testing.T) {
 	mustPut(t, db, "unsaved", "no")
 
 	// Simulate the process stopping before Sync.
-	db.file.Close()
-	db.closed = true
+	crash(db)
 
 	db = openDB(t, path)
 	wantValue(t, db, "saved", "yes")

@@ -1,3 +1,4 @@
 *.db
 *.exe
 INTERVIEW_NOTES.md
+*.wal

@@ -27,12 +27,15 @@ var (
 // It is not safe for use by several goroutines or processes at once.
 type DB struct {
 	file   *os.File
+	wal    *walLog
 	pager  *pager
 	root   uint64
 	closed bool
 }
 
-// Open opens the database at path, creating it if it does not exist.
+// Open opens the database at path, creating it if it does not exist. Changes
+// left in the log by a crash are recovered first. The log is stored at
+// path + ".wal" and must stay with the database file.
 func Open(path string) (*DB, error) {
 	return openWithCache(path, defaultCachePages)
 }
@@ -42,22 +45,69 @@ func openWithCache(path string, cachePages int) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := load(file, cachePages)
+	wal, err := openWALLog(path + ".wal")
 	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	db, err := recoverAndLoad(file, wal, cachePages)
+	if err != nil {
+		wal.close()
 		file.Close()
 		return nil, err
 	}
 	return db, nil
 }
 
-func load(file *os.File, cachePages int) (*DB, error) {
+func recoverAndLoad(file *os.File, wal *walLog, cachePages int) (*DB, error) {
+	if err := recoverFromLog(file, wal); err != nil {
+		return nil, err
+	}
+	return load(file, wal, cachePages)
+}
+
+// recoverFromLog copies complete logged transactions into the database file.
+// It is safe to repeat if another crash interrupts it, because the log is only
+// emptied after the pages are durable.
+func recoverFromLog(file *os.File, wal *walLog) error {
+	pages, err := wal.readCommitted()
+	if err != nil {
+		return err
+	}
+	ids := make([]uint64, 0, len(pages))
+	for id, payload := range pages {
+		if len(payload) != PayloadSize {
+			return fmt.Errorf("%w: log entry for page %d has %d bytes", ErrCorrupt, id, len(payload))
+		}
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+
+	data := make([]byte, PageSize)
+	for _, id := range ids {
+		copy(data[checksumSize:], pages[id])
+		sealPage(data)
+		if _, err := file.WriteAt(data, int64(id)*PageSize); err != nil {
+			return fmt.Errorf("recover page %d: %w", id, err)
+		}
+	}
+	if len(ids) > 0 {
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("sync recovered pages: %w", err)
+		}
+	}
+	// This also discards any incomplete transaction at the end of the log.
+	return wal.reset()
+}
+
+func load(file *os.File, wal *walLog, cachePages int) (*DB, error) {
 	info, err := file.Stat()
 	if err != nil {
 		return nil, err
 	}
 	size := info.Size()
 	if size == 0 {
-		return create(file, cachePages)
+		return create(file, wal, cachePages)
 	}
 	if size%PageSize != 0 || size < 2*PageSize {
 		return nil, fmt.Errorf("%w: invalid file size %d", ErrCorrupt, size)
@@ -78,11 +128,11 @@ func load(file *os.File, cachePages int) (*DB, error) {
 		return nil, fmt.Errorf("%w: invalid metadata", ErrCorrupt)
 	}
 	p.numPages = numPages
-	return &DB{file: file, pager: p, root: root}, nil
+	return &DB{file: file, wal: wal, pager: p, root: root}, nil
 }
 
-func create(file *os.File, cachePages int) (*DB, error) {
-	db := &DB{file: file, pager: newPager(file, 0, cachePages)}
+func create(file *os.File, wal *walLog, cachePages int) (*DB, error) {
+	db := &DB{file: file, wal: wal, pager: newPager(file, 0, cachePages)}
 	db.pager.allocate() // page 0 is reserved for metadata
 	root, err := db.storeNew(&node{leaf: true})
 	if err != nil {
@@ -294,7 +344,12 @@ func (db *DB) Scan(start, end []byte, fn func(key, value []byte) bool) error {
 	}
 }
 
-// Sync writes all changes to disk.
+// Sync makes all changes durable as one transaction.
+//
+// The order matters: once the log and its commit record are on disk, the
+// transaction is safe. Only then is the database file changed, and only after
+// that is the log emptied. A crash at any point leaves either the old state or
+// a log that can complete the new state.
 func (db *DB) Sync() error {
 	if db.closed {
 		return ErrClosed
@@ -305,7 +360,13 @@ func (db *DB) Sync() error {
 	if err := db.markMetaDirty(); err != nil {
 		return err
 	}
-	return db.pager.flush()
+	if err := db.wal.appendTransaction(db.pager.dirtyPages()); err != nil {
+		return err
+	}
+	if err := db.pager.flush(); err != nil {
+		return err
+	}
+	return db.wal.reset()
 }
 
 // Close saves all changes and closes the file.
@@ -315,7 +376,7 @@ func (db *DB) Close() error {
 	}
 	syncErr := db.Sync()
 	db.closed = true
-	return errors.Join(syncErr, db.file.Close())
+	return errors.Join(syncErr, db.wal.close(), db.file.Close())
 }
 
 // Height returns the number of levels in the tree.
